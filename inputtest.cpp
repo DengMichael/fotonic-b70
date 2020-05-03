@@ -1,16 +1,26 @@
 #include <libusb-1.0/libusb.h>
 #include <opencv2/opencv.hpp>
+
+#include <pcl/common/common_headers.h>
+#include <pcl/range_image/range_image.h>
+#include <pcl/visualization/range_image_visualizer.h>
+#include <pcl/visualization/pcl_visualizer.h>
+#include <pcl/common/transforms.h>
+
 #include <iostream>
 #include <cstring>
 #include <fstream>
 #include <bitset>
 #include <thread>
 #include <chrono>
-using namespace std;
+#include <mutex>
+#include <condition_variable>
 
 #define EP_OUT 0x02
 #define EP_IN 0x81
 #define EP_OTHER 0x83
+
+#define NUMBER_OF_FRAME_TRANSFERS 10
 
 #define VID 0x0525
 #define PID 0xA9A0
@@ -18,7 +28,7 @@ using namespace std;
 #define COMMAND_BUFFER_SIZE 436
 #define COMMAND_RESPONSE_BUFFER_SIZE 436
 
-#define FRAME_BUFFER_SIZE 77924
+#define FRAME_BUFFER_SIZE 77924 * 2
 #define FRAME_SIZE 19200
 
 #define INUMX 160
@@ -53,223 +63,295 @@ using namespace std;
 #define CMD_DE_SET_MS_TYPE 0x4032
 #define CMD_DE_GET_MS_TYPE 0x4033
 
-void user_loop(int &get_frames)
+//--CMD PARAMETERS--
+
+//CMD_DE_SET_MODE parameter
+#define DE_MODE_TEMPORAL 0x0
+#define DE_MODE_SPATIAL 0x1 //not currently working
+#define DE_MODE_SPATIO_TEMPORAL 0x3
+#define DE_MODE_MULTI_ST 0x5
+#define DE_MODE_ZFAST 0x6
+#define DE_MODE_ZFINE 0x7
+#define DE_MODE_MS_ST 0xA
+#define DE_MODE_BM_ZFINE 0xB	//experimental
+#define DE_MODE_BM_TEMPORAL 0xC //experimental
+
+//CMD_DE_SET_MS_TYPE parameter
+#define DE_MS_TYPE_SATURATION 0x0
+#define DE_MS_TYPE_WEIGHTED_AVG 0x1
+#define DE_MS_TYPE_RATIO 0x2
+
+std::mutex m;
+std::condition_variable condv;
+bool display_greyscale = true;
+bool get_frames = true;
+bool update_viewer = false;
+
+//
+int frames_obtained = 0;
+
+auto t1 = std::chrono::high_resolution_clock::now();
+
+float theta = M_PI; // The angle of rotation in radians
+Eigen::Affine3f transform = Eigen::Affine3f::Identity();
+pcl::PointCloud<pcl::PointXYZRGB>::Ptr initialize_pointcloud()
 {
+	pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloud_ptr(new pcl::PointCloud<pcl::PointXYZRGB>);
+	cloud_ptr->width = INUMX;
+	cloud_ptr->height = INUMY;
+	transform.rotate(Eigen::AngleAxisf(theta, Eigen::Vector3f::UnitZ()));
+	return cloud_ptr;
+}
+
+pcl::visualization::PCLVisualizer::Ptr initialize_visualizer(pcl::PointCloud<pcl::PointXYZRGB>::ConstPtr cloud)
+{
+	pcl::visualization::PCLVisualizer::Ptr viewer(new pcl::visualization::PCLVisualizer("3D Viewer"));
+	viewer->setBackgroundColor(0, 0, 0);
+	viewer->addPointCloud<pcl::PointXYZRGB>(cloud, "cloud");
+	viewer->setPointCloudRenderingProperties(pcl::visualization::PCL_VISUALIZER_POINT_SIZE, 1, "cloud");
+	viewer->addCoordinateSystem(1.0);
+	viewer->initCameraParameters();
+	return viewer;
+}
+
+pcl::PointCloud<pcl::PointXYZRGB>::Ptr point_cloud_ptr;
+pcl::visualization::PCLVisualizer::Ptr viewer;
+
+//4 matrices for every frame
+cv::Mat frames[NUMBER_OF_FRAME_TRANSFERS][4];
+
+void user_loop()
+{
+	std::string str;
 	do
 	{
-		cout << "Press x to stop image stream" << endl;
-	} while (cin.get() != 'x');
-	get_frames = 0;
+		do
+		{
+			cout << "Enter x to stop image stream " << endl;
+			cout << "Enter g to display greyscale" << endl;
+			cout << "Enter c to display color" << endl;
+			cout << "Enter b to change background to black" << endl;
+			cout << "Enter w to change background to white" << endl;
+			getline(cin, str);
+		} while (str != "x" && str != "g" && str != "c" && str != "b" && str != "w");
+		if (str == "g")
+		{
+			display_greyscale = true;
+		}
+		else if (str == "c")
+		{
+			display_greyscale = false;
+		}
+		else if (str == "b")
+		{
+			viewer->setBackgroundColor(0, 0, 0);
+		}
+		else if (str == "w")
+		{
+			viewer->setBackgroundColor(255, 255, 255);
+		}
+	} while (str != "x");
+	update_viewer = false;
+	get_frames = false;
+	//cancel all transfers
 	return;
 }
 
-class frames
+int current_callback_packet = 0;
+int frame_to_process = 0;
+void spin_loop()
 {
-public:
-	cv::Mat *b_display_frame, *z_display_frame, *x_display_frame, *y_display_frame;
-	frames(cv::Mat *input_b_frame, cv::Mat *input_z_frame, cv::Mat *input_x_frame, cv::Mat *input_y_frame);
-};
-
-frames::frames(cv::Mat *input_b_frame, cv::Mat *input_z_frame, cv::Mat *input_x_frame, cv::Mat *input_y_frame)
-{
-	b_display_frame = input_b_frame;
-	z_display_frame = input_z_frame;
-	x_display_frame = input_x_frame;
-	y_display_frame = input_y_frame;
-}
-
-static void LIBUSB_CALL
-xfr_cb_out(struct libusb_transfer *transfer)
-{
-	int *completed = (int *)transfer->user_data;
-	short *frame = (short *)transfer->buffer;
-	short b_frame[19200];
-	short z_frame[19200];
-	short x_frame[19200];
-	short y_frame[19200];
-
-	//skip first row (664) - then 4s afterwards.
-	for (int y = 0; y < INUMY; y++)
+	unsigned iActiveBrightnessVMin = 20;
+	unsigned iActiveBrightnessVMax = 340;
+	while (get_frames)
 	{
-		int iRowPosB = ((y + 1) * INUMX) * 4 + (INUMX * 0); //640
-		int iRowPosZ = ((y + 1) * INUMX) * 4 + (INUMX * 1);
-		int iRowPosX = ((y + 1) * INUMX) * 4 + (INUMX * 2);
-		int iRowPosY = ((y + 1) * INUMX) * 4 + (INUMX * 3); //77280
-		//		cout << "posy:" << iRowPosY << endl;
-		for (int x = 0; x < INUMX; x++)
+		std::unique_lock<std::mutex> lk(m);
+		condv.wait(lk, [] { return update_viewer; }); //wait for callback
+		if (current_callback_packet == 0)
 		{
-			// row format: Bx160, Zx160, Xx160, Yx160 (16bit per component)
-			int frameIndex = y * INUMX + x;
-			b_frame[frameIndex] = frame[4 * (y + 2) + iRowPosB + x]; // 8
-			//code says
-			// scale by 10, will give 1.0 = 1.0 centimeter
-			z_frame[frameIndex] = frame[4 * (y + 2) + iRowPosZ + x];
-			x_frame[frameIndex] = frame[4 * (y + 2) + iRowPosX + x];
-			y_frame[frameIndex] = frame[4 * (y + 2) + iRowPosY + x]; //77923
-			if (frameIndex == 19199)
+			frame_to_process = NUMBER_OF_FRAME_TRANSFERS - 1;
+		}
+		else
+		{
+			frame_to_process = current_callback_packet - 1;
+		}
+		point_cloud_ptr->clear();
+
+		if (display_greyscale)
+		{
+			for (int y = 0; y < INUMY; y++)
 			{
-				cout << "end" << endl;
-				cout << frameIndex << endl;
-				cout << 4 * (y + 2) + iRowPosY + x << endl;
-				cout << y_frame[frameIndex] << endl;
-				cout << y_frame[19199] << endl;
-				cout << frame[4 * (y + 2) + iRowPosY + x] << endl;
-				cout << frame[77923] << endl;
+				for (int x = 0; x < INUMX; x++)
+				{
+					pcl::PointXYZRGB point;
+					point.z = (float)frames[frame_to_process][1].at<short>(y, x) * 0.1f;
+					point.x = (float)frames[frame_to_process][2].at<short>(y, x) * 0.1f;
+					point.y = (float)frames[frame_to_process][3].at<short>(y, x) * 0.1f;
+
+					int iTmpB = (frames[frame_to_process][0].at<short>(y, x) * 0.1f) - iActiveBrightnessVMin;
+					iTmpB = (int)(iTmpB / ((iActiveBrightnessVMax - iActiveBrightnessVMin) / 256.0));
+					if (iTmpB < 0)
+						iTmpB = 0;
+					if (iTmpB > 255)
+						iTmpB = 255;
+					//r = 0-127
+					//g = 0-127 then 128 to 255
+					//b = 128 to 255
+					point.r = iTmpB;
+					point.g = iTmpB;
+					point.b = iTmpB;
+
+					point_cloud_ptr->points.push_back(point);
+				}
 			}
 		}
+		else
+		{
+			for (int y = 0; y < INUMY; y++)
+			{
+				for (int x = 0; x < INUMX; x++)
+				{
+					pcl::PointXYZRGB point;
+					point.z = (float)frames[frame_to_process][1].at<short>(y, x) * 0.1f;
+					point.x = (float)frames[frame_to_process][2].at<short>(y, x) * 0.1f;
+					point.y = (float)frames[frame_to_process][3].at<short>(y, x) * 0.1f;
+					int iTmpB = (frames[frame_to_process][0].at<short>(y, x) * 0.1f) - iActiveBrightnessVMin;
+					iTmpB = (int)(iTmpB / ((iActiveBrightnessVMax - iActiveBrightnessVMin) / 256.0));
+					if (iTmpB < 0)
+						iTmpB = 0;
+					if (iTmpB > 255)
+						iTmpB = 255;
+					//r = 0-127
+					//g = 0-127 then 128 to 255
+					//b = 128 to 255
+					if (iTmpB < 127)
+					{
+						point.r = 255 - (iTmpB * 2);
+						point.g = iTmpB * 2;
+						point.b = 0;
+					}
+					else
+					{
+						point.r = 0;
+						point.g = (255 - (iTmpB - 128) * 2); //as b increases, g decreases at twice that rate.
+						point.b = (iTmpB - 128) * 2;
+					}
+					point_cloud_ptr->points.push_back(point);
+				}
+			}
+		}
+
+		pcl::transformPointCloud(*point_cloud_ptr, *point_cloud_ptr, transform);
+		viewer->updatePointCloud(point_cloud_ptr, "cloud");
+
+		cv::normalize(frames[frame_to_process][0], frames[frame_to_process][0], -32768, 32768, cv::NORM_MINMAX);
+		cv::normalize(frames[frame_to_process][1], frames[frame_to_process][1], -32768, 32768, cv::NORM_MINMAX);
+		cv::normalize(frames[frame_to_process][2], frames[frame_to_process][2], -32768, 32768, cv::NORM_MINMAX);
+		cv::normalize(frames[frame_to_process][3], frames[frame_to_process][3], -32768, 32768, cv::NORM_MINMAX);
+
+		cv::imshow("B", frames[frame_to_process][0]);
+		cv::imshow("Z", frames[frame_to_process][1]);
+		cv::imshow("X", frames[frame_to_process][2]);
+		cv::imshow("Y", frames[frame_to_process][3]);
+		viewer->spinOnce();
+		update_viewer = false;
+
+		cv::waitKey(1);
 	}
-	//apply a mask to remove the 0 values - then alter
+	return;
+}
 
-	pair<short *, short *> minmaxB = minmax_element(begin(b_frame), end(b_frame));
-	cout << "The min element in B is " << *(minmaxB.first) << '\n';
-	cout << "The max element in B is " << *(minmaxB.second) << '\n';
-	pair<short *, short *> minmaxZ = minmax_element(begin(z_frame), end(z_frame));
-	cout << "The min element in Z is " << *(minmaxZ.first) << '\n';
-	cout << "The max element in Z is " << *(minmaxZ.second) << '\n';
-	pair<short *, short *> minmaxX = minmax_element(begin(x_frame), end(x_frame));
-	cout << "The min element in X is " << *(minmaxX.first) << '\n';
-	cout << "The max element in X is " << *(minmaxX.second) << '\n';
-	pair<short *, short *> minmaxY = minmax_element(begin(y_frame), end(y_frame));
-	cout << "The min element in Y is " << *(minmaxY.first) << '\n';
-	cout << "The max element in Y is " << *(minmaxY.second) << '\n';
+static void LIBUSB_CALL xfr_cb_out(struct libusb_transfer *transfer)
+{
+	frames_obtained += 1;
+	unsigned short *frame_buffer = (unsigned short *)transfer->buffer;
+	//skip first row (664) - then 4s afterwards.
 
-	cv::Mat imageframe = cv::Mat(INUMY_WITH_ADDITIONAL_ROW, FOUR_INUMX_WITH_BUFFER, CV_16UC1, frame); //hmmm
-	// get min/max values using OpenCV min_max function
-	double minVal, maxVal;
-	cv::minMaxLoc(imageframe, &minVal, &maxVal);
-	//	cout << "pre-norm min/max = " << minVal << " " << maxVal << " " << endl;
-	cv::minMaxLoc(imageframe, &minVal, &maxVal);
-	//	cout << "post-norm min/max = " << minVal << " " << maxVal << " " << endl;
-	cv::Mat for_display_only;
-	imageframe.convertTo(for_display_only, CV_8UC1);
-	cv::namedWindow("test", cv::WINDOW_AUTOSIZE);
+	for (int y = 0; y < INUMY; y++)
+	{
+		int iRowPosB = ((y + 1) * INUMX) * 4 + (INUMX * 0);
+		int iRowPosZ = ((y + 1) * INUMX) * 4 + (INUMX * 1);
+		int iRowPosX = ((y + 1) * INUMX) * 4 + (INUMX * 2);
+		int iRowPosY = ((y + 1) * INUMX) * 4 + (INUMX * 3);
+		for (int x = 0; x < INUMX; x++)
+		{
+			int iColumnPos = 4 * (y + 2) + x;
+			// row format: Bx160, Zx160, Xx160, Yx160 (16bit per component)
+			frames[current_callback_packet][0].at<short>(y, x) = frame_buffer[iRowPosB + iColumnPos];
+			frames[current_callback_packet][1].at<short>(y, x) = frame_buffer[iRowPosZ + iColumnPos];
+			frames[current_callback_packet][1].at<short>(y, x) = (frames[current_callback_packet][1].at<short>(y, x) == 65535) ? 0 : frames[current_callback_packet][1].at<short>(y, x);
+			//code says
+			// scale by 10, will give 1.0 = 1.0 centimeter
+			frames[current_callback_packet][2].at<short>(y, x) = frame_buffer[iRowPosX + iColumnPos];
+			frames[current_callback_packet][3].at<short>(y, x) = frame_buffer[iRowPosY + iColumnPos];
+		}
+	}
+	if (current_callback_packet < NUMBER_OF_FRAME_TRANSFERS - 1)
+	{
+		current_callback_packet += 1;
+	}
+	else
+	{
+		current_callback_packet = 0;
+	}
+	update_viewer = true;
+	condv.notify_one(); //tell spin_loop to render
 
-	cv::Mat b_display_frame = cv::Mat(INUMY, INUMX, CV_16UC1, b_frame); //hmmm
-	// get min/max values using OpenCV min_max function
-	minVal, maxVal;
-	cv::minMaxLoc(b_display_frame, &minVal, &maxVal);
-	cout << "pre-norm min/maxb = " << minVal << " " << maxVal << " " << endl;
-	cv::normalize(b_display_frame, b_display_frame, 0, 65280, cv::NORM_MINMAX);
-	cv::minMaxLoc(b_display_frame, &minVal, &maxVal);
-	cout << "post-norm min/maxb = " << minVal << " " << maxVal << " " << endl;
-	cv::namedWindow("B", cv::WINDOW_NORMAL);
+	/*
 
-	cv::Mat z_display_frame = cv::Mat(INUMY, INUMX, CV_16UC1, z_frame); //hmmm
-	// get min/max values using OpenCV min_max function
-	minVal, maxVal;
-	cv::minMaxLoc(z_display_frame, &minVal, &maxVal);
+	cv::minMaxLoc(frames[1], &minVal, &maxVal);
 	cout << "pre-norm min/maxz = " << minVal << " " << maxVal << " " << endl;
-	//	cv::normalize(z_display_frame, z_display_frame, 0, 1, cv::NORM_MINMAX);
-	cv::minMaxLoc(z_display_frame, &minVal, &maxVal);
+	cv::minMaxLoc(frames[1], &minVal, &maxVal);
 	cout << "post-norm min/maxz = " << minVal << " " << maxVal << " " << endl;
-	cv::Mat z_for_display_only;
-	z_display_frame.convertTo(z_for_display_only, CV_8UC1);
-	cv::namedWindow("Z", cv::WINDOW_NORMAL);
+	cv::minMaxLoc(frames[2], &minVal, &maxVal);
+	//	cout << "pre-norm min/maxx = " << minVal << " " << maxVal << " " << endl;
+	cv::minMaxLoc(frames[2], &minVal, &maxVal);
+	//	cout << "post-norm min/maxx = " << minVal << " " << maxVal << " " << endl;
 
-	//8 bit frame
-	//logarithmic
-	//exponential
-	//histogram
-	//contrast stretch
+	cv::minMaxLoc(frames[3], &minVal, &maxVal);
+	//	cout << "pre-norm min/maxy = " << minVal << " " << maxVal << " " << endl;
+	cv::minMaxLoc(frames[3], &minVal, &maxVal);
+	//	cout << "post-norm min/maxy = " << minVal << " " << maxVal << " " << endl;
+	*/
+
+	if (get_frames)
+	{
+		libusb_submit_transfer(transfer);
+		if (frames_obtained == 10000)
+		{
+			auto t2 = std::chrono::high_resolution_clock::now();
+			std::cout << "f() took "
+					  << std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count()
+					  << " milliseconds\n";
+			frames_obtained = 0;
+
+			t1 = std::chrono::high_resolution_clock::now();
+		}
+	}
 
 	//write as pngs
 
-	cv::Mat x_display_frame = cv::Mat(INUMY, INUMX, CV_16UC1, x_frame); //hmmm
-	// get min/max values using OpenCV min_max function
-	minVal, maxVal;
-	cv::minMaxLoc(x_display_frame, &minVal, &maxVal);
-	cout << "pre-norm min/maxx = " << minVal << " " << maxVal << " " << endl;
-	cv::normalize(x_display_frame, x_display_frame, 0, 1, cv::NORM_MINMAX);
-	cv::minMaxLoc(x_display_frame, &minVal, &maxVal);
-	cout << "post-norm min/maxx = " << minVal << " " << maxVal << " " << endl;
-	cv::namedWindow("X", cv::WINDOW_NORMAL);
-
-	cv::Mat y_display_frame = cv::Mat(INUMY, INUMX, CV_16UC1, y_frame); //hmmm
-	// get min/may values using OpenCV min_may function
-	minVal, maxVal;
-	cv::minMaxLoc(y_display_frame, &minVal, &maxVal);
-	cout << "pre-norm min/maxy = " << minVal << " " << maxVal << " " << endl;
-	cv::normalize(y_display_frame, y_display_frame, 0, 1, cv::NORM_MINMAX);
-	cv::minMaxLoc(y_display_frame, &minVal, &maxVal);
-	cout << "post-norm min/maxy = " << minVal << " " << maxVal << " " << endl;
-	cv::namedWindow("Y", cv::WINDOW_NORMAL);
-
-	cv::imshow("test", for_display_only);
-	cv::imshow("B", b_display_frame);
-	cv::imshow("Z", z_for_display_only);
-	cv::imshow("X", x_display_frame);
-	cv::imshow("Y", y_display_frame);
-	//	cv::imshow("calcHist Demo", histImage);
-
-	//the fps issue - how to resolve it
-	//i need to run a thread that synchronizes everything properly
-	//time from the
-	cv::waitKey(1);
-
-	*completed = 1;
-}
-
-void printarray(unsigned short *input, int n)
-{
-	// loop through the elements of the array
-	for (int i = 0; i < n; i++)
-	{
-		std::cout << input[i] << " " << i << std::endl;
-	}
-	std::cout << input[0] << " first" << std::endl;
-	std::cout << input[1] << " second" << std::endl;
-
 	return;
 }
 
-unsigned short stringtounsignedshort(string input)
-{
-	unsigned short output = (unsigned short)strtoul(input.c_str(), NULL, 16);
-	return output;
-}
-
-unsigned short swapendianunsignedshort(unsigned short input)
-{
-	unsigned short endian = (input << 8) | (input >> 8);
-	return endian;
-}
-
-unsigned short *hexstringtoarray(std::string input)
-{
-	int n = input.size();
-	printf("\n%i index\n", n);
-	unsigned short *output = new unsigned short[n];
-	for (int index = 0; index < n; index += 4)
-	{
-		string bytestrings = input.substr(index, 4);
-		output[index / 4] = swapendianunsignedshort(stringtounsignedshort(bytestrings));
-	}
-	return output;
-}
-
-void fill_command(unsigned short *command_buffer, unsigned short *command_counter, unsigned short command, unsigned short parameter)
+void fill_command(unsigned short (&command_buffer)[COMMAND_BUFFER_SIZE], unsigned short &command_counter, unsigned short command, unsigned short parameter)
 {
 	const static int command_counter_location = 0;
 	const static int command_location = 2;
-	const static int parameter_location = 8; //15
-	cout << *command_counter << endl;
-	cout << command << endl;
-	cout << parameter << endl;
-	//fill by entering code
+	const static int parameter_location = 8;
 	command_buffer[command_location] = command;
 	command_buffer[parameter_location] = parameter;
-	command_buffer[command_counter_location] = *command_counter;
+	command_buffer[command_counter_location] = command_counter;
 	return;
 }
 
 //takes required libusb, buffer, and command, send to device
-void send_command(unsigned short *command_buffer, unsigned short *command_counter, unsigned short command, unsigned short parameter, libusb_device_handle *dev_handle)
+void send_command(unsigned short (&command_buffer)[COMMAND_BUFFER_SIZE], unsigned short &command_counter, unsigned short command, unsigned short parameter, libusb_device_handle *dev_handle)
 {
 	//convert
 	memset(command_buffer, 0, COMMAND_BUFFER_SIZE);
 	int command_transferred = 0;
 	fill_command(command_buffer, command_counter, command, parameter);
-	printarray(command_buffer, 436);
 	int status = libusb_bulk_transfer(
 		dev_handle,
 		EP_OUT,
@@ -277,12 +359,12 @@ void send_command(unsigned short *command_buffer, unsigned short *command_counte
 		COMMAND_BUFFER_SIZE,			 //unsigned unsigned short
 		&command_transferred,			 //int*
 		0);
-	printf("Transferred: %i\n", command_transferred);
-	*command_counter += 1;
-	cout << "sent command" << endl;
+	printf("Sent %i bytes\n", command_transferred);
+
+	command_counter += 1;
 }
 
-void recieve_command_response(unsigned short *command_response_buffer, int command_response_transferred, libusb_device_handle *dev_handle)
+void recieve_command_response(unsigned short (&command_response_buffer)[COMMAND_RESPONSE_BUFFER_SIZE], int command_response_transferred, libusb_device_handle *dev_handle)
 {
 	memset(command_response_buffer, 0, COMMAND_RESPONSE_BUFFER_SIZE);
 	command_response_transferred = 0;
@@ -293,21 +375,11 @@ void recieve_command_response(unsigned short *command_response_buffer, int comma
 		COMMAND_RESPONSE_BUFFER_SIZE,			  //unsigned unsigned short
 		&command_response_transferred,			  //int*
 		0);
-	printf("Transferred: %i\n", command_response_transferred);
-	cout << "recieved command response" << endl;
+	printf("Recieved %i\n", command_response_transferred);
 }
 
-//parameter is probably the wrong type
-//assume command is in the right format
-
-int main(void)
+int main()
 {
-	unsigned short command_buffer[436];
-	int command_transferred = 0;
-	unsigned short command_counter = 9;
-	unsigned short parameter = 3;
-	unsigned short command_response_buffer[436];
-	int command_response_transferred;
 
 	static struct libusb_device_handle *dev_handle = NULL;
 	static struct libusb_device *dev;
@@ -315,13 +387,11 @@ int main(void)
 	static struct libusb_context *mContext;
 	unsigned int i;
 	int status = 0;
-	//
 
 	libusb_init(&mContext);
 	//	libusb_set_debug(mContext, 4);
 	int rc;
 	libusb_get_device_list(NULL, &devs);
-	int completed = 0;
 	for (i = 0; (dev = devs[i]) != NULL; i++)
 	{
 		struct libusb_device_descriptor desc;
@@ -335,7 +405,6 @@ int main(void)
 		}
 		cout << desc.idVendor << endl;
 
-		cout << "hiya" << endl;
 		if ((VID == desc.idVendor) && (PID == desc.idProduct))
 		{
 			printf("Product: %x\n", desc.idVendor);
@@ -347,25 +416,6 @@ int main(void)
 			rc = libusb_claim_interface(dev_handle, 0);
 			printf("Interface: %i\n", rc);
 			libusb_set_interface_alt_setting(dev_handle, 0, 1);
-			//
-			libusb_control_transfer(dev_handle,
-									0,
-									11,
-									1,
-									0,
-									0, //data
-									0,
-									0);
-			printf("Reset: %i\n", rc);
-			rc = libusb_clear_halt(dev_handle,
-								   EP_IN);
-			printf("Clear: %i\n", rc);
-			rc = libusb_clear_halt(dev_handle,
-								   EP_OUT);
-			printf("Clear: %i\n", rc);
-			rc = libusb_clear_halt(dev_handle,
-								   EP_OTHER);
-			printf("Clear: %i\n", rc);
 
 			int transferred;
 			std::cout << "libusb_get_device_descriptor(" << std::endl;
@@ -374,494 +424,99 @@ int main(void)
 			//another buffer to get outputs
 
 			//function to fill buffer with command and value
+			unsigned short command_buffer[436];
+			int command_transferred = 0;
+			unsigned short command_counter = 9;
+			unsigned short parameter = 3;
+			unsigned short command_response_buffer[436];
+			int command_response_transferred;
 
-			//			unsigned short *data = hexstringtoarray("01000000024000000000840000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000");
-			unsigned short *data = hexstringtoarray("01000000024000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000");
-
-			status = libusb_bulk_transfer(
-				dev_handle,
-				EP_OUT,
-				(unsigned char *)data, //unsigned char*
-				436,				   //unsigned unsigned short
-				&transferred,		   //int*
-				0);
-			printf("Transferred: %i\n", transferred);
-
-			unsigned short data1[218];
-			int transferred1;
-			status = libusb_bulk_transfer(
-				dev_handle,
-				EP_IN,
-				(unsigned char *)&data1, //unsigned char*
-				sizeof(data1),			 //unsigned unsigned short
-				&transferred1,			 //int*
-				0);
-			printf("Transferred: %i\n", transferred1);
-			//			data = hexstringtoarray("02000000084002000000000000000000050000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000");
-			//			data = hexstringtoarray("02000000084000000000000000000000050000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000");
-
-			//setmode
-			status = libusb_bulk_transfer(
-				dev_handle,
-				EP_OUT,
-				(unsigned char *)data, //unsigned char*
-				436,				   //unsigned unsigned short
-				&transferred,		   //int*
-				0);
-			printf("Transferred: %i\n", transferred);
-
-			status = libusb_bulk_transfer(
-				dev_handle,
-				EP_IN,
-				(unsigned char *)&data1, //unsigned char*
-				sizeof(data1),			 //unsigned unsigned short
-				&transferred1,			 //int*
-				0);
-			printf("Transferred: %i\n", transferred1);
-
-			data = hexstringtoarray("03000000034002000000000000000000901012000000000015000000084002000000000000000000050000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000");
-
-			status = libusb_bulk_transfer(
-				dev_handle,
-				EP_OUT,
-				(unsigned char *)data, //unsigned char*
-				436,				   //unsigned unsigned short
-				&transferred,		   //int*
-				0);
-			printf("Transferred: %i\n", transferred);
-
-			status = libusb_bulk_transfer(
-				dev_handle,
-				EP_IN,
-				(unsigned char *)&data1, //unsigned char*
-				sizeof(data1),			 //unsigned unsigned short
-				&transferred1,			 //int*
-				0);
-			printf("Transferred: %i\n", transferred1);
-			//it's just a trace of the old commands for tracking????????
-			//but sometimes they just disappear
-			data = hexstringtoarray("04000000054002000000000000000000280000000000000000fe1200000000001600000003400200000000000000000064001200000000001500000008400200000000000000000005000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000");
-
-			status = libusb_bulk_transfer(
-				dev_handle,
-				EP_OUT,
-				(unsigned char *)data, //unsigned char*
-				436,				   //unsigned unsigned short
-				&transferred,		   //int*
-				0);
-			printf("Transferred: %i\n", transferred);
-
-			status = libusb_bulk_transfer(
-				dev_handle,
-				EP_IN,
-				(unsigned char *)&data1, //unsigned char*
-				sizeof(data1),			 //unsigned unsigned short
-				&transferred1,			 //int*
-				0);
-			printf("Transferred: %i\n", transferred1);
-
-			data = hexstringtoarray("050000002a4002000000000000000000010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000");
-
-			status = libusb_bulk_transfer(
-				dev_handle,
-				EP_OUT,
-				(unsigned char *)data, //unsigned char*
-				436,				   //unsigned unsigned short
-				&transferred,		   //int*
-				0);
-			printf("Transferred: %i\n", transferred);
-
-			status = libusb_bulk_transfer(
-				dev_handle,
-				EP_IN,
-				(unsigned char *)&data1, //unsigned char*
-				sizeof(data1),			 //unsigned unsigned short
-				&transferred1,			 //int*
-				0);
-			printf("Transferred: %i\n", transferred1);
-
-			data = hexstringtoarray("060000000340040000000000000000006400320000000000180000002a4002000000000000000000010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000");
-			status = libusb_bulk_transfer(
-				dev_handle,
-				EP_OUT,
-				(unsigned char *)data, //unsigned char*
-				436,				   //unsigned unsigned short
-				&transferred,		   //int*
-				0);
-			printf("Transferred: %i\n", transferred);
-
-			status = libusb_bulk_transfer(
-				dev_handle,
-				EP_IN,
-				(unsigned char *)&data1, //unsigned char*
-				sizeof(data1),			 //unsigned unsigned short
-				&transferred1,			 //int*
-				0);
-			printf("Transferred: %i\n", transferred1);
-
-			data = hexstringtoarray("0700000030400200000000000000000020030000000000000000000000000000190000000340040000000000000000006400320000000000180000002a400200000000000000000001000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000");
-			status = libusb_bulk_transfer(
-				dev_handle,
-				EP_OUT,
-				(unsigned char *)data, //unsigned char*
-				436,				   //unsigned unsigned short
-				&transferred,		   //int*
-				0);
-			printf("Transferred: %i\n", transferred);
-
-			status = libusb_bulk_transfer(
-				dev_handle,
-				EP_IN,
-				(unsigned char *)&data1, //unsigned char*
-				sizeof(data1),			 //unsigned unsigned short
-				&transferred1,			 //int*
-				0);
-			printf("Transferred: %i\n", transferred1);
-
-			data = hexstringtoarray("08000000324002000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000");
-			status = libusb_bulk_transfer(
-				dev_handle,
-				EP_OUT,
-				(unsigned char *)data, //unsigned char*
-				436,				   //unsigned unsigned short
-				&transferred,		   //int*
-				0);
-			printf("Transferred: %i\n", transferred);
-
-			status = libusb_bulk_transfer(
-				dev_handle,
-				EP_IN,
-				(unsigned char *)&data1, //unsigned char*
-				sizeof(data1),			 //unsigned unsigned short
-				&transferred1,			 //int*
-				0);
-			printf("Transferred: %i\n", transferred1);
-
-			printarray(data, 436);
-
-			//so i guess i can remove everything past that point
-			//data = hexstringtoarray("0900000006400200000000000000000001000000000000001b000000324002000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000");
-
-			send_command(command_buffer, &command_counter, CMD_DE_SET_LSSWITCH, 1, dev_handle);
+			send_command(command_buffer, command_counter, CMD_DE_SENSOR_STOP, 0, dev_handle);
 			recieve_command_response(command_response_buffer, command_response_transferred, dev_handle);
 
-			//data = hexstringtoarray("09000000064000000000000000000000010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000");
-			/*
-			status = libusb_bulk_transfer(
-				dev_handle,
-				EP_OUT,
-				(unsigned char *)data, //unsigned char*
-				436,				   //unsigned unsigned short
-				&transferred,		   //int*
-				0);
-			printf("Transferred: %i\n", transferred);
+			send_command(command_buffer, command_counter, CMD_DE_SET_MODE, DE_MODE_MULTI_ST, dev_handle);
+			recieve_command_response(command_response_buffer, command_response_transferred, dev_handle);
 
-			printarray(data, 436);
-			//
+			send_command(command_buffer, command_counter, CMD_DE_SET_SHUTTER, 100, dev_handle);
+			recieve_command_response(command_response_buffer, command_response_transferred, dev_handle);
 
-			status = libusb_bulk_transfer(
-				dev_handle,
-				EP_IN,
-				(unsigned char *)&data1, //unsigned char*
-				sizeof(data1),			 //unsigned unsigned short
-				&transferred1,			 //int*
-				0);
-			printf("Transferred: %i\n", transferred1);
-			*/
+			send_command(command_buffer, command_counter, CMD_DE_SET_FPS, 40, dev_handle);
+			recieve_command_response(command_response_buffer, command_response_transferred, dev_handle);
 
-			data = hexstringtoarray("0a00000003400200000000000000000020030000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000bcf91200b7fc907c080000000100000000000000080000002cfa1200c2fd907c00000000000000000000140000000000c4fa120008000000ddfd907c01000000ffffffff000000000000000000d0fd7fccfa120000100000000000000000000000001400000000000000000034fa1200e0f91200eada907ce82d917c18000000a0fd1200a0fd120001000000ffffffff000000007cfe12004406817c4adb907c8706817cf0000000a306817cd84d3d00e7c2437e212c557800000000000000009f0100014b00000000000000000015000301000000b0fd7f20040000480e0000010000000800000000000000e8061500000015000100000000000000000000000000400100f03f010000300100000000");
-			status = libusb_bulk_transfer(
-				dev_handle,
-				EP_OUT,
-				(unsigned char *)data, //unsigned char*
-				436,				   //unsigned unsigned short
-				&transferred,		   //int*
-				0);
-			printf("Transferred: %i\n", transferred);
+			send_command(command_buffer, command_counter, CMD_DE_SET_FPS_DIVISOR, 1, dev_handle);
+			recieve_command_response(command_response_buffer, command_response_transferred, dev_handle);
 
-			status = libusb_bulk_transfer(
-				dev_handle,
-				EP_IN,
-				(unsigned char *)&data1, //unsigned char*
-				sizeof(data1),			 //unsigned unsigned short
-				&transferred1,			 //int*
-				0);
-			printf("Transferred: %i\n", transferred1);
+			//Set shutter again for multi-shutter apparently?
+			send_command(command_buffer, command_counter, CMD_DE_SET_SHUTTER, 100, dev_handle);
+			recieve_command_response(command_response_buffer, command_response_transferred, dev_handle);
 
-			data = hexstringtoarray("0b0000000540020000000000000000002800000000000000b8fe1200000000001d00000003400200000000000000000020030000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000bcf91200b7fc907c080000000100000000000000080000002cfa1200c2fd907c00000000000000000000140000000000c4fa120008000000ddfd907c01000000ffffffff000000000000000000d0fd7fccfa120000100000000000000000000000001400000000000000000034fa1200e0f91200eada907ce82d917c18000000a0fd1200a0fd120001000000ffffffff000000007cfe12004406817c4adb907c8706817cf0000000a306817cd84d3d00e7c2437e212c557800000000000000009f0100014b00000000000000000015000301000000b0fd7f20040000480e0000010000000800000000000000e8061500");
-			status = libusb_bulk_transfer(
-				dev_handle,
-				EP_OUT,
-				(unsigned char *)data, //unsigned char*
-				436,				   //unsigned unsigned short
-				&transferred,		   //int*
-				0);
-			printf("Transferred: %i\n", transferred);
+			send_command(command_buffer, command_counter, CMD_DE_SET_MS_SATURATION, 800, dev_handle);
+			recieve_command_response(command_response_buffer, command_response_transferred, dev_handle);
 
-			status = libusb_bulk_transfer(
-				dev_handle,
-				EP_IN,
-				(unsigned char *)&data1, //unsigned char*
-				sizeof(data1),			 //unsigned unsigned short
-				&transferred1,			 //int*
-				0);
-			printf("Transferred: %i\n", transferred1);
+			send_command(command_buffer, command_counter, CMD_DE_SET_MS_TYPE, DE_MS_TYPE_SATURATION, dev_handle);
+			recieve_command_response(command_response_buffer, command_response_transferred, dev_handle);
 
-			data = hexstringtoarray("0c0000002a40020000000000000000000100000000000000b8fe1200000000001d00000003400200000000000000000020030000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000bcf91200b7fc907c080000000100000000000000080000002cfa1200c2fd907c00000000000000000000140000000000c4fa120008000000ddfd907c01000000ffffffff000000000000000000d0fd7fccfa120000100000000000000000000000001400000000000000000034fa1200e0f91200eada907ce82d917c18000000a0fd1200a0fd120001000000ffffffff000000007cfe12004406817c4adb907c8706817cf0000000a306817cd84d3d00e7c2437e212c557800000000000000009f0100014b00000000000000000015000301000000b0fd7f20040000480e0000010000000800000000000000e8061500");
-			status = libusb_bulk_transfer(
-				dev_handle,
-				EP_OUT,
-				(unsigned char *)data, //unsigned char*
-				436,				   //unsigned unsigned short
-				&transferred,		   //int*
-				0);
-			printf("Transferred: %i\n", transferred);
+			send_command(command_buffer, command_counter, CMD_DE_SET_LSSWITCH, 1, dev_handle);
+			recieve_command_response(command_response_buffer, command_response_transferred, dev_handle);
 
-			status = libusb_bulk_transfer(
-				dev_handle,
-				EP_IN,
-				(unsigned char *)&data1, //unsigned char*
-				sizeof(data1),			 //unsigned unsigned short
-				&transferred1,			 //int*
-				0);
-			printf("Transferred: %i\n", transferred1);
+			// This is where custom settings are set in the original.
 
-			data = hexstringtoarray("0d0000000540020000001200000000003c00000003400200000000000000000020030000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000bcf91200b7fc907c080000000100000000000000080000002cfa1200c2fd907c00000000000000000000140000000000c4fa120008000000ddfd907c01000000ffffffff000000000000000000d0fd7fccfa120000100000000000000000000000001400000000000000000034fa1200e0f91200eada907ce82d917c18000000a0fd1200a0fd120001000000ffffffff000000007cfe12004406817c4adb907c8706817cf0000000a306817cd84d3d00e7c2437e212c557800000000000000009f0100014b00000000000000000015000301000000b0fd7f20040000480e0000010000000800000000000000e806150000001500010000000000000000000000");
-			status = libusb_bulk_transfer(
-				dev_handle,
-				EP_OUT,
-				(unsigned char *)data, //unsigned char*
-				436,				   //unsigned unsigned short
-				&transferred,		   //int*
-				0);
-			printf("Transferred: %i\n", transferred);
+			libusb_transfer *transfers[NUMBER_OF_FRAME_TRANSFERS];
+			short frame_buffers[NUMBER_OF_FRAME_TRANSFERS][FRAME_BUFFER_SIZE];
 
-			status = libusb_bulk_transfer(
-				dev_handle,
-				EP_IN,
-				(unsigned char *)&data1, //unsigned char*
-				sizeof(data1),			 //unsigned unsigned short
-				&transferred1,			 //int*
-				0);
-			printf("Transferred: %i\n", transferred1);
-			////////////////////////////////////////
+			cv::namedWindow("B", cv::WINDOW_NORMAL);
+			cv::namedWindow("Z", cv::WINDOW_NORMAL);
+			cv::namedWindow("X", cv::WINDOW_NORMAL);
+			cv::namedWindow("Y", cv::WINDOW_NORMAL);
 
-			data = hexstringtoarray("0e00000008400200000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000bcf91200b7fc907c080000000100000000000000080000002cfa1200c2fd907c00000000000000000000140000000000c4fa120008000000ddfd907c01000000ffffffff000000000000000000d0fd7fccfa120000100000000000000000000000001400000000000000000034fa1200e0f91200eada907ce82d917c18000000a0fd1200a0fd120001000000ffffffff000000007cfe12004406817c4adb907c8706817cf0000000a306817cd84d3d00e7c2437e212c557800000000000000009f0100014b00000000000000000015000301000000b0fd7f20040000480e0000010000000800000000000000e8061500000015000100000000000000000000000000400100f03f010000300100000000");
-			status = libusb_bulk_transfer(
-				dev_handle,
-				EP_OUT,
-				(unsigned char *)data, //unsigned char*
-				436,				   //unsigned unsigned short
-				&transferred,		   //int*
-				0);
-			printf("Transferred: %i\n", transferred);
+			//callback is sequential
+			point_cloud_ptr = initialize_pointcloud();
+			viewer = initialize_visualizer(point_cloud_ptr);
 
-			status = libusb_bulk_transfer(
-				dev_handle,
-				EP_IN,
-				(unsigned char *)&data1, //unsigned char*
-				sizeof(data1),			 //unsigned unsigned short
-				&transferred1,			 //int*
-				0);
-			printf("Transferred: %i\n", transferred1);
+			for (int i = 0; i < NUMBER_OF_FRAME_TRANSFERS; i++)
+			{
+				frames[i][0] = cv::Mat(INUMY, INUMX, CV_16SC1);
+				frames[i][1] = cv::Mat(INUMY, INUMX, CV_16SC1);
+				frames[i][2] = cv::Mat(INUMY, INUMX, CV_16SC1);
+				frames[i][3] = cv::Mat(INUMY, INUMX, CV_16SC1);
 
-			data = hexstringtoarray("0f0000000540020000000000000000003c00000000000000b8fe1200000000002100000008400200000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000bcf91200b7fc907c080000000100000000000000080000002cfa1200c2fd907c00000000000000000000140000000000c4fa120008000000ddfd907c01000000ffffffff000000000000000000d0fd7fccfa120000100000000000000000000000001400000000000000000034fa1200e0f91200eada907ce82d917c18000000a0fd1200a0fd120001000000ffffffff000000007cfe12004406817c4adb907c8706817cf0000000a306817cd84d3d00e7c2437e212c557800000000000000009f0100014b00000000000000000015000301000000b0fd7f20040000480e0000010000000800000000000000e8061500");
-			status = libusb_bulk_transfer(
-				dev_handle,
-				EP_OUT,
-				(unsigned char *)data, //unsigned char*
-				436,				   //unsigned unsigned short
-				&transferred,		   //int*
-				0);
-			printf("Transferred: %i\n", transferred);
+				transfers[i] = libusb_alloc_transfer(0);
+				libusb_fill_bulk_transfer(transfers[i], dev_handle, EP_OTHER, (unsigned char *)&(frame_buffers[i]), sizeof(frame_buffers[i]), xfr_cb_out, NULL, 0);
+			}
+			cout << "Hi3" << endl;
 
-			status = libusb_bulk_transfer(
-				dev_handle,
-				EP_IN,
-				(unsigned char *)&data1, //unsigned char*
-				sizeof(data1),			 //unsigned unsigned short
-				&transferred1,			 //int*
-				0);
-			printf("Transferred: %i\n", transferred1);
+			std::thread input_thread(user_loop);
+			std::thread spin_thread(spin_loop);
 
-			data = hexstringtoarray("100000002a40020000000000000000000100000000000000b8fe1200000000002100000008400200000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000bcf91200b7fc907c080000000100000000000000080000002cfa1200c2fd907c00000000000000000000140000000000c4fa120008000000ddfd907c01000000ffffffff000000000000000000d0fd7fccfa120000100000000000000000000000001400000000000000000034fa1200e0f91200eada907ce82d917c18000000a0fd1200a0fd120001000000ffffffff000000007cfe12004406817c4adb907c8706817cf0000000a306817cd84d3d00e7c2437e212c557800000000000000009f0100014b00000000000000000015000301000000b0fd7f20040000480e0000010000000800000000000000e8061500");
-			status = libusb_bulk_transfer(
-				dev_handle,
-				EP_OUT,
-				(unsigned char *)data, //unsigned char*
-				436,				   //unsigned unsigned short
-				&transferred,		   //int*
-				0);
-			printf("Transferred: %i\n", transferred);
+			t1 = std::chrono::high_resolution_clock::now();
+			for (int i = 0; i < NUMBER_OF_FRAME_TRANSFERS; i++)
+			{
+				libusb_submit_transfer(transfers[i]);
+			}
 
-			status = libusb_bulk_transfer(
-				dev_handle,
-				EP_IN,
-				(unsigned char *)&data1, //unsigned char*
-				sizeof(data1),			 //unsigned unsigned short
-				&transferred1,			 //int*
-				0);
-			printf("Transferred: %i\n", transferred1);
-
-			data = hexstringtoarray("1100000037400a000000000000000000010002000000b10001600000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000bcf91200b7fc907c080000000100000000000000080000002cfa1200c2fd907c00000000000000000000140000000000c4fa120008000000ddfd907c01000000ffffffff000000000000000000d0fd7fccfa120000100000000000000000000000001400000000000000000034fa1200e0f91200eada907ce82d917c18000000a0fd1200a0fd120001000000ffffffff000000007cfe12004406817c4adb907c8706817cf0000000a306817cd84d3d00e7c2437e212c557800000000000000009f0100014b00000000000000000015000301000000b0fd7f20040000480e0000010000000800000000000000e8061500000015000100000000000000000000000000400100f03f01");
-			status = libusb_bulk_transfer(
-				dev_handle,
-				EP_OUT,
-				(unsigned char *)data, //unsigned char*
-				436,				   //unsigned unsigned short
-				&transferred,		   //int*
-				0);
-			printf("Transferred: %i\n", transferred);
-
-			status = libusb_bulk_transfer(
-				dev_handle,
-				EP_IN,
-				(unsigned char *)&data1, //unsigned char*
-				sizeof(data1),			 //unsigned unsigned short
-				&transferred1,			 //int*
-				0);
-			printf("Transferred: %i\n", transferred1);
-
-			data = hexstringtoarray("12000000304002000000000000000000010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000bcf91200b7fc907c080000000100000000000000080000002cfa1200c2fd907c00000000000000000000140000000000c4fa120008000000ddfd907c01000000ffffffff000000000000000000d0fd7fccfa120000100000000000000000000000001400000000000000000034fa1200e0f91200eada907ce82d917c18000000a0fd1200a0fd120001000000ffffffff000000007cfe12004406817c4adb907c8706817cf0000000a306817cd84d3d00e7c2437e212c557800000000000000009f0100014b00000000000000000015000301000000b0fd7f20040000480e0000010000000800000000000000e8061500000015000100000000000000000000000000400100f03f0100003001000000000000000020040000480e0000ffffffff");
-			status = libusb_bulk_transfer(
-				dev_handle,
-				EP_OUT,
-				(unsigned char *)data, //unsigned char*
-				436,				   //unsigned unsigned short
-				&transferred,		   //int*
-				0);
-			printf("Transferred: %i\n", transferred);
-
-			status = libusb_bulk_transfer(
-				dev_handle,
-				EP_IN,
-				(unsigned char *)&data1, //unsigned char*
-				sizeof(data1),			 //unsigned unsigned short
-				&transferred1,			 //int*
-				0);
-			printf("Transferred: %i\n", transferred1);
-
-			data = hexstringtoarray("13000000324002000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000bcf91200b7fc907c080000000100000000000000080000002cfa1200c2fd907c00000000000000000000140000000000c4fa120008000000ddfd907c01000000ffffffff000000000000000000d0fd7fccfa120000100000000000000000000000001400000000000000000034fa1200e0f91200eada907ce82d917c18000000a0fd1200a0fd120001000000ffffffff000000007cfe12004406817c4adb907c8706817cf0000000a306817cd84d3d00e7c2437e212c557800000000000000009f0100014b00000000000000000015000301000000b0fd7f20040000480e0000010000000800000000000000e8061500000015000100000000000000000000000000400100f03f0100003001000000000000000020040000480e0000ffffffff");
-			status = libusb_bulk_transfer(
-				dev_handle,
-				EP_OUT,
-				(unsigned char *)data, //unsigned char*
-				436,				   //unsigned unsigned short
-				&transferred,		   //int*
-				0);
-			printf("Transferred: %i\n", transferred);
-
-			status = libusb_bulk_transfer(
-				dev_handle,
-				EP_IN,
-				(unsigned char *)&data1, //unsigned char*
-				sizeof(data1),			 //unsigned unsigned short
-				&transferred1,			 //int*
-				0);
-			printf("Transferred: %i\n", transferred1);
-
-			//
-
-			data = hexstringtoarray("14000000014000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000");
-			status = libusb_bulk_transfer(
-				dev_handle,
-				EP_OUT,
-				(unsigned char *)data, //unsigned char*
-				436,				   //unsigned unsigned short
-				&transferred,		   //int*
-				0);
-			printf("Transferred: %i\n", transferred);
-
-			status = libusb_bulk_transfer(
-				dev_handle,
-				EP_IN,
-				(unsigned char *)&data1, //unsigned char*
-				sizeof(data1),			 //unsigned unsigned short
-				&transferred1,			 //int*
-				0);
-			printf("Transferred: %i\n", transferred1);
-
-			short frame[FRAME_BUFFER_SIZE];
-			short frame2[FRAME_BUFFER_SIZE];
-
-			struct libusb_transfer *transfer;
-			//			struct libusb_transfer *transfer2;
-			transfer = libusb_alloc_transfer(0);
-			//			transfer2 = libusb_alloc_transfer(0);
-			//
-
-			//data structure with 4 buffers
-
-			//
-			libusb_fill_bulk_transfer(transfer, dev_handle, EP_OTHER, (unsigned char *)&frame, sizeof(frame), xfr_cb_out, &completed, 0); //&completed
-			//			libusb_fill_bulk_transfer(transfer2, dev_handle, EP_OTHER, (unsigned char *)&frame2, sizeof(frame2), xfr_cb_out, &completed, 0);
-
-			int get_frames = 1;
-
-			thread user_input(user_loop, ref(get_frames));
-			//this is where i start threading i suppose
-			//i guess i make an image display thread instead
-			//i pass the matrices to my bulk transfer - letting the callback function edit them
-			//my image display thread updates, every x values
-			/* Handle Events */
-
-			/*
-
-			//pass to the bulk transfers
-			//create 4 matrices, etc, i keep filling those buffers in,
-			//meanwhile my imshow thread recieves the buffer and reads it
-
-			*/
+			send_command(command_buffer, command_counter, CMD_DE_SENSOR_START, 0, dev_handle);
+			recieve_command_response(command_response_buffer, command_response_transferred, dev_handle);
 
 			while (get_frames)
 			{
-				//submit a transfer,
-				//convert it to rain
-				//i think the best way to is to read multiple streams.
-				//add a stream, they'll all use the same callback function - so it should be fine?
-				//just test it
-				libusb_submit_transfer(transfer);
-				cout << "hello" << endl;
-				//imshow here
-
-				cout << "hello2" << endl;
-				while (!completed)
+				rc = libusb_handle_events(NULL);
+				if (rc != LIBUSB_SUCCESS)
 				{
-					rc = libusb_handle_events_completed(NULL, &completed);
-					if (rc != LIBUSB_SUCCESS)
-					{
-						fprintf(stderr, "Transfer Error: %s\n", libusb_error_name(rc));
-						break;
-					}
+					fprintf(stderr, "Transfer Error: %s\n", libusb_error_name(rc));
+					break;
 				}
-				completed = 0;
 			}
 
-			//////////////////// THEORETICAL END
-			//join here
-			user_input.join();
-			libusb_free_transfer(transfer);
-			//			libusb_free_transfer(transfer2);
+			input_thread.join();
+			spin_thread.join();
+			//free all transfers
+			for (int i = 0; i < 10; i++)
+			{
+				libusb_free_transfer(transfers[i]);
+			}
 
-			//stop camera
-			data = hexstringtoarray("14000000024000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000");
-			status = libusb_bulk_transfer(
-				dev_handle,
-				EP_OUT,
-				(unsigned char *)data, //unsigned char*
-				436,				   //unsigned unsigned short
-				&transferred,		   //int*
-				0);
-			printf("Transferred: %i\n", transferred);
-
-			status = libusb_bulk_transfer(
-				dev_handle,
-				EP_IN,
-				(unsigned char *)&data1, //unsigned char*
-				sizeof(data1),			 //unsigned unsigned short
-				&transferred1,			 //int*
-				0);
-			printf("Transferred: %i\n", transferred1);
+			send_command(command_buffer, command_counter, CMD_DE_SENSOR_STOP, 0, dev_handle);
+			recieve_command_response(command_response_buffer, command_response_transferred, dev_handle);
 		};
 		libusb_release_interface(dev_handle, 0);
 		libusb_close(dev_handle);
